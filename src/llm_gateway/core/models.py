@@ -5,15 +5,16 @@ Core Pydantic models for the LLM Gateway, with comprehensive support for
 the Model Context Protocol (MCP) standard alongside gateway-specific features.
 Defines contracts for data flow, configuration, context, and results.
 """
-
+import logging
 import uuid
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union, Type, AsyncGenerator, cast
+from typing import Any, Dict, List, Optional, Union, Type, AsyncGenerator, cast, Literal
 
 from pydantic import BaseModel, Field, model_validator, field_validator, ConfigDict
 
 # --- Base Model with Common Config ---
+logger = logging.getLogger(__name__)
 
 class BaseGatewayModel(BaseModel):
     """Base model for common configuration like assignment validation."""
@@ -676,7 +677,14 @@ class GatewayConfig(BaseGatewayModel):
     # MCP specific global config
     mcp_api_endpoint: Optional[str] = Field(None, description="Global endpoint for MCP providers if applicable.")
     mcp_enabled_models: List[str] = Field(default_factory=list, description="List of model_identifiers explicitly supporting MCP.")
-
+    providers: Dict[str, ProviderConfig] = Field(default_factory=dict, description="Configuration for each specific provider instance.")
+    model_provider_mapping: Dict[str, str] = Field(default_factory=dict, description="Optional explicit mapping from model_identifier to provider_id.")
+    preload_providers: List[str] = Field(default_factory=list, description="List of provider_ids to initialize on gateway startup.")
+    # Configuration for interventions
+    interventions: Dict[str, Dict[str, Any]] = Field(default_factory=dict, description="Definitions and configurations for available interventions.")
+    # Routing strategy can be simple string or more complex object
+    routing_strategy: Union[str, Dict[str, Any]] = Field("default", description="Strategy for selecting providers (e.g., 'default', 'round_robin', {'type': 'latency_based', ...}).")
+    failover_enabled: bool = Field(True, description="Whether to attempt failover to another provider on error.")
 
 # --- Synchronous API Typehint ---
 class AsyncIterableStreamChunk(AsyncGenerator[StreamChunk, None]):
@@ -826,6 +834,78 @@ class MCPConverter:
         }
         return mapping.get(reason, FinishReason.UNKNOWN)
 
+    @staticmethod
+    def _content_item_to_mcp(item: Union[ContentItem, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Convert ContentItem to MCP content block, returning None on failure."""
+        try:
+            if isinstance(item, ContentItem):
+                # Basic structure - adjust based on actual MCP spec for each type
+                mcp_block = {"type": item.type.value}
+                if item.type == MCPContentType.TEXT:
+                    mcp_block["text"] = item.data.get("text", "")
+                elif item.type == MCPContentType.IMAGE:
+                    # Example: Assumes MCP expects source directly
+                    mcp_block.update(item.data.get("image", {}))
+                elif item.type == MCPContentType.TOOL_USE:
+                    mcp_block.update(item.data.get("tool_use", {}))
+                elif item.type == MCPContentType.TOOL_RESULT:
+                    mcp_block.update(item.data.get("tool_result", {}))
+                else:
+                     # Handle other types or use item.data directly
+                    mcp_block.update(item.data)
+                return mcp_block
+            elif isinstance(item, dict) and "type" in item:
+                # Assume it's already MCP-like
+                return item
+            else:
+                logger.warning(f"Cannot convert item to MCP block: Invalid type {type(item)}")
+                return None
+        except Exception as e:
+            logger.error(f"Error converting ContentItem to MCP block: {e}", exc_info=True)
+            return None
+
+    @staticmethod
+    def gateway_to_mcp_message(turn: ConversationTurn) -> Optional[Dict[str, Any]]:
+        """Convert a Gateway ConversationTurn to MCP message format, returning None on failure."""
+        # ... (mapping logic)
+        mapped_content_blocks = []
+        if isinstance(turn.content, str):
+             content_list = [{"type": "text", "text": turn.content}]
+        elif isinstance(turn.content, list):
+             content_list = [MCPConverter._content_item_to_mcp(item) for item in turn.content]
+             # Filter out None results from failed conversions
+             mapped_content_blocks = [block for block in content_list if block is not None]
+             if not mapped_content_blocks and turn.content: # Log if all items failed
+                  logger.warning(f"Failed to convert any content items for turn {turn.turn_id}")
+                  return None
+        # ... (handle dict case if needed)
+        else:
+             logger.warning(f"Unsupported content type in ConversationTurn {turn.turn_id}: {type(turn.content)}")
+             return None
+
+        # Map role using existing helper or direct mapping
+        mcp_role = turn.role # Assuming turn.role is already MCP compatible string
+        # Or use a mapping function if needed:
+        # mcp_role = MCPConverter._map_gateway_role_to_mcp(turn.role)
+        # if mcp_role is None: return None
+
+        return {
+            "role": mcp_role,
+            "content": mapped_content_blocks,
+            # "id": turn.turn_id, # Optional based on MCP spec
+            "metadata": turn.metadata
+
+        }
+    # Add a specific exception for routing errors
+    class RoutingError(Exception):
+        """Custom exception for provider routing failures."""
+        pass
+
+    # Refine ErrorDetails to include stage
+    class ErrorDetails(BaseGatewayModel):
+        """Structured error information."""
+        # ... (previous fields) ...
+        stage: Optional[Literal["pre_intervention", "provider_call", "post_intervention", "stream_intervention", "manager", "factory", "client"]] = None
 
 
 # --- Example Usage ---

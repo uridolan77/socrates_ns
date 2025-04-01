@@ -6,17 +6,6 @@ from typing import Dict, List, Any, Optional, Tuple, Set
 import numpy as np
 from dataclasses import dataclass
 
-@dataclass
-class ViolationSummary:
-    """Summary of compliance violations found during filtering."""
-    violation_count: int
-    severity_counts: Dict[str, int]  # Counts by severity level
-    categories: Dict[str, int]       # Counts by violation category
-    top_rules: List[Dict[str, Any]]  # Most frequently triggered rules
-    primary_severity: str            # Most severe violation level
-    timestamp: float                 # When the analysis was performed
-    suggestion: Optional[str] = None # Suggested remediation
-
 class ComplianceConstraintOptimizer:
     """
     Optimizes compliance constraints to balance compliance requirements and user experience.

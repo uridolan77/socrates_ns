@@ -2,6 +2,7 @@
 
 import logging
 from typing import Dict, Type, Optional, List
+import asyncio
 
 # Gateway core models
 from llm_gateway.core.models import ProviderConfig, GatewayConfig
@@ -31,37 +32,21 @@ class ProviderFactory:
     to the actual provider implementation classes.
     """
 
-    def __init__(self):
-        """Initializes the ProviderFactory and registers known provider types."""
-        self._provider_registry: Dict[str, Type[BaseProvider]] = {}
-        self._register_known_providers()
-        logger.info(f"ProviderFactory initialized with registered types: {list(self._provider_registry.keys())}")
-
     def _register_known_providers(self):
         """Registers the provider classes known to this factory."""
-        # Register providers using a unique type string (e.g., matching config)
         self.register_provider("openai", OpenAIClient)
         self.register_provider("anthropic", AnthropicClient)
         self.register_provider("mcp", MCPProvider)
         self.register_provider("mock", MockClient)
-        # Add other providers here as they are implemented
+        # Add other providers here
 
     def register_provider(self, provider_type: str, provider_class: Type[BaseProvider]):
-        """
-        Registers a provider type string and its corresponding class.
-
-        Args:
-            provider_type: The unique string identifier for the provider type (e.g., 'openai').
-            provider_class: The class implementing the BaseProvider interface.
-
-        Raises:
-            ValueError: If the provider_type is already registered.
-        """
+        """Registers a provider type string and its corresponding class."""
         type_lower = provider_type.lower()
-        if type_lower in self._provider_registry:
-            logger.warning(f"Provider type '{type_lower}' is already registered. Overwriting is not allowed by default.")
-            # Or raise ValueError(f"Provider type '{type_lower}' already registered.")
-            return # Avoid overwriting silently unless intended
+        if type_lower in self._provider_registry and not self._allow_overwrite:
+            raise ValueError(f"Provider type '{type_lower}' already registered and overwrite is disallowed.")
+        elif type_lower in self._provider_registry and self._allow_overwrite:
+            logger.warning(f"Provider type '{type_lower}' is already registered. Overwriting.")
 
         if not issubclass(provider_class, BaseProvider):
              raise TypeError(f"Provider class {provider_class.__name__} must inherit from BaseProvider.")
@@ -73,30 +58,62 @@ class ProviderFactory:
          """Returns a list of registered provider type strings."""
          return list(self._provider_registry.keys())
 
-    def create_provider(
-        self,
-        provider_id: str, # Added for context in logging/errors
-        provider_config: ProviderConfig,
-        gateway_config: GatewayConfig
-    ) -> BaseProvider:
+    async def get_provider(self, provider_id: str, provider_config: ProviderConfig, gateway_config: GatewayConfig) -> BaseProvider:
         """
-        Creates and returns an instance of the specified LLM provider.
+        Gets or creates a provider instance. Ensures only one instance per provider_id.
+        Includes asynchronous initialization pattern.
 
         Args:
-            provider_id: A unique identifier for this specific provider instance (e.g., 'azure-gpt4-eastus').
-            provider_config: The configuration object for the provider instance.
-                             Must contain a valid 'provider_type'.
-            gateway_config: The global gateway configuration object.
+            provider_id: Unique ID for the specific provider instance.
+            provider_config: Configuration for this provider instance.
+            gateway_config: Global gateway configuration.
 
         Returns:
-            An initialized instance of the requested provider class inheriting from BaseProvider.
+            An initialized provider instance.
 
         Raises:
-            ProviderFactoryError: If the provider type is unknown, or if instantiation fails.
-            TypeError: If configuration arguments are invalid.
+            ProviderFactoryError: If creation or initialization fails.
         """
+        # Ensure lock exists for the provider_id
+        if provider_id not in self._instance_locks:
+            # This needs its own lock to prevent race conditions when creating instance locks
+            # A simpler approach might be to pre-populate locks if provider_ids are known upfront
+            # For dynamic providers, this lock needs careful handling.
+            # Using a single lock for lock creation for simplicity here:
+            async with asyncio.Lock(): # Temporary lock for creating the specific lock
+                if provider_id not in self._instance_locks:
+                    self._instance_locks[provider_id] = asyncio.Lock()
+
+        async with self._instance_locks[provider_id]:
+            if provider_id not in self._provider_instances:
+                logger.info(f"Creating new provider instance for ID: {provider_id}")
+                try:
+                    instance = self._create_provider_sync( # Keep instantiation sync
+                        provider_id=provider_id,
+                        provider_config=provider_config,
+                        gateway_config=gateway_config
+                    )
+                    # Perform async initialization if the method exists
+                    if hasattr(instance, "initialize_async") and callable(instance.initialize_async):
+                         logger.info(f"Running async initialization for provider {provider_id}...")
+                         await instance.initialize_async()
+                         logger.info(f"Async initialization complete for {provider_id}.")
+
+                    self._provider_instances[provider_id] = instance
+                except Exception as e:
+                     # Catch errors during creation or async init
+                     logger.error(f"Failed to create or initialize provider '{provider_id}': {e}", exc_info=True)
+                     # Remove potentially partial instance if error occurred
+                     if provider_id in self._provider_instances:
+                          del self._provider_instances[provider_id]
+                     raise ProviderFactoryError(f"Failed to get provider '{provider_id}': {e}") from e
+
+            return self._provider_instances[provider_id]
+
+    def _create_provider_sync(self, provider_id: str, provider_config: ProviderConfig, gateway_config: GatewayConfig) -> BaseProvider:
+        """Synchronously instantiates a provider class."""
         if not provider_config or not hasattr(provider_config, 'provider_type'):
-            raise TypeError("Invalid provider_config provided. Must be a ProviderConfig object with 'provider_type'.")
+            raise TypeError("Invalid provider_config. Must be ProviderConfig with 'provider_type'.")
 
         provider_type = provider_config.provider_type
         if not provider_type or not isinstance(provider_type, str):
@@ -105,52 +122,56 @@ class ProviderFactory:
         provider_type_lower = provider_type.lower()
         provider_class = self._provider_registry.get(provider_type_lower)
 
-        # 1. Handle Unknown Provider Type
         if not provider_class:
-            error_message = (f"Unknown provider type '{provider_type}' requested for provider ID '{provider_id}'. "
-                             f"Registered types are: {self.get_registered_types()}")
-            logger.error(error_message)
-            raise ProviderFactoryError(error_message)
+            raise ProviderFactoryError(
+                f"Unknown provider type '{provider_type}' for ID '{provider_id}'. "
+                f"Registered: {self.get_registered_types()}"
+            )
 
-        logger.info(f"Creating provider instance for ID '{provider_id}' of type '{provider_type}' using class {provider_class.__name__}...")
-
-        # 2. Handle Instantiation Errors
+        logger.info(f"Instantiating provider ID '{provider_id}' (Type: '{provider_type}')")
         try:
-            # Instantiate the provider class, passing necessary configs
+            # Instantiate, passing necessary configs
             provider_instance = provider_class(
                 provider_config=provider_config,
                 gateway_config=gateway_config
             )
-            logger.info(f"Successfully created provider instance for ID '{provider_id}'.")
+            logger.info(f"Successfully instantiated provider ID '{provider_id}'.")
             return provider_instance
-
-        except (ValueError, TypeError, KeyError) as config_err:
-            # Errors often related to missing/invalid config values or API keys within provider __init__
-            error_message = (f"Configuration error during instantiation of provider ID '{provider_id}' "
-                             f"(type: '{provider_type}'): {config_err}")
-            logger.error(error_message, exc_info=True) # Include traceback for config errors
-            raise ProviderFactoryError(error_message) from config_err
-
-        except ConnectionError as conn_err:
-             # Errors related to initial connectivity checks if performed in __init__
-            error_message = (f"Connection error during instantiation of provider ID '{provider_id}' "
-                             f"(type: '{provider_type}'): {conn_err}")
-            logger.error(error_message, exc_info=False) # Don't need full traceback for simple connection fail
-            raise ProviderFactoryError(error_message) from conn_err
-
-        except ImportError as import_err:
-            # Handles cases where provider dependencies might be missing, though ideally caught earlier
-             error_message = (f"Import error likely due to missing dependencies for provider type '{provider_type}' "
-                              f"(provider ID: '{provider_id}'): {import_err}")
-             logger.error(error_message, exc_info=False)
-             raise ProviderFactoryError(error_message) from import_err
-
         except Exception as e:
-            # Catch any other unexpected errors during provider initialization
-            error_message = (f"Unexpected error during instantiation of provider ID '{provider_id}' "
-                             f"(type: '{provider_type}'): {e}")
-            logger.error(error_message, exc_info=True) # Include traceback for unexpected errors
-            raise ProviderFactoryError(error_message) from e
+            # Log details but re-raise as factory error
+            logger.error(f"Instantiation error for provider '{provider_id}': {e}", exc_info=True)
+            raise ProviderFactoryError(f"Instantiation failed for '{provider_id}': {e}") from e
+
+    def get_cached_instance(self, provider_id: str) -> Optional[BaseProvider]:
+         """Gets a cached provider instance if it exists, without creating."""
+         return self._provider_instances.get(provider_id)
+
+    def get_all_cached_instances(self) -> List[BaseProvider]:
+         """Gets all currently cached provider instances."""
+         return list(self._provider_instances.values())
+
+    async def cleanup_all(self):
+         """Cleans up all cached provider instances."""
+         logger.info(f"Cleaning up {len(self._provider_instances)} provider instance(s)...")
+         tasks = []
+         provider_ids = list(self._provider_instances.keys()) # Avoid dict size change during iteration
+         for provider_id in provider_ids:
+              instance = self._provider_instances.pop(provider_id, None)
+              if instance and hasattr(instance, "cleanup") and callable(instance.cleanup):
+                   logger.debug(f"Scheduling cleanup for provider {provider_id}")
+                   tasks.append(instance.cleanup())
+              # Remove lock too
+              if provider_id in self._instance_locks:
+                   del self._instance_locks[provider_id]
+
+         if tasks:
+              results = await asyncio.gather(*tasks, return_exceptions=True)
+              for i, result in enumerate(results):
+                   if isinstance(result, Exception):
+                        # Find corresponding provider ID - relies on order
+                        # A more robust way would be to wrap tasks with metadata
+                        logger.error(f"Error during cleanup for a provider: {result}") # ID unknown here easily
+         logger.info("Provider instance cleanup complete.")
 
 
 # Example Usage (typically called by the GatewayManager)

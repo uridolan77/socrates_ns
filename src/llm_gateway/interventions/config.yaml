@@ -1,0 +1,99 @@
+gateway_id: main_gateway
+default_provider: openai_gpt4_default # provider_id from below
+max_retries: 1
+retry_delay_seconds: 0.5
+default_timeout_seconds: 45
+allowed_providers: ["openai_gpt4_default", "anthropic_claude3", "mcp_local", "mock_basic"]
+caching_enabled: true
+cache_default_ttl_seconds: 600
+default_compliance_mode: "strict"
+logging_level: "INFO"
+
+preload_providers: ["openai_gpt4_default"] # Warm up this provider on start
+
+# --- Provider Definitions ---
+additional_config:
+  max_concurrent_batch_requests: 8 # For client semaphore
+  providers:
+    openai_gpt4_default:
+      provider_type: openai
+      # display_name: "OpenAI GPT-4 (Default)" # Optional
+      connection_params:
+        api_key_env_var: OPENAI_API_KEY # Standard key
+      models:
+        # Key is model_identifier used in requests, value can hold provider-specific details if needed
+        gpt-4-turbo-preview: {}
+        gpt-4: {}
+        gpt-3.5-turbo: {}
+
+    anthropic_claude3:
+      provider_type: anthropic
+      connection_params:
+        api_key_env_var: ANTHROPIC_API_KEY
+      models:
+        claude-3-opus-20240229: {}
+        claude-3-sonnet-20240229: {}
+
+    mcp_local:
+      provider_type: mcp
+      connection_params:
+        command: "/path/to/your/mcp/server/executable" # Or "npx" etc.
+        args: ["--model", "local-mcp-model-name", "--port", "auto"]
+        env: {"MCP_SERVER_API_KEY_VAR": "YOUR_MCP_KEY"} # Env vars for the server process
+        enable_streaming: false # Example: Disable streaming for this one
+      models:
+        local-mcp-model-name: {} # Model ID served by this MCP process
+
+    mock_basic:
+      provider_type: mock
+      connection_params:
+        simulate_delay_ms: 20
+        mock_response_text: "Mock response for model {model_id} from {provider_id}."
+      models:
+        mock-model-1: {}
+        mock-model-fast: {}
+
+  # --- Intervention Definitions ---
+  interventions:
+    # Example 1: Simple Logger
+    request_logger:
+      enabled: true # This flag might not be needed if presence implies registration
+      class: "llm_gateway.interventions.examples.LoggingIntervention"
+      hook_type: "pre_post" # Runs before and after
+      config:
+        log_level: "DEBUG"
+
+    # Example 2: Keyword Blocker
+    keyword_blocker:
+      enabled: true
+      class: "llm_gateway.interventions.examples.KeywordBlocker"
+      hook_type: "pre" # Only check prompt
+      config:
+        blocked_keywords: ["secret_project_alpha", "confidential_stuff"]
+        case_sensitive: false
+
+    # Example 3: Compliance Checker (Conceptual)
+    gdpr_compliance:
+      enabled: true
+      class: "llm_gateway.interventions.compliance.GDPRComplianceCheck" # Assumed path
+      hook_type: "post"
+      config:
+        strict_mode: true
+        required_rulesets: ["data_minimization", "consent_verification"]
+        # ... other compliance config
+
+  # --- Default Pipeline ---
+  default_intervention_config:
+    enabled_pre_interventions: ["request_logger", "keyword_blocker"]
+    enabled_post_interventions: ["request_logger", "gdpr_compliance"]
+    # enabled_stream_interventions: [] # Example if needed
+    total_intervention_timeout_ms: 5000 # Timeout for the *chain* of pre OR post
+    fail_open: false # If an intervention fails, block the request/response
+
+  # --- Model to Provider Mapping (Optional, Explicit) ---
+  # If not provided, uses fallback logic in manager._get_provider_id_for_model
+  # model_provider_mapping:
+  #   "gpt-4-turbo-preview": "openai_gpt4_default"
+  #   "claude-3-opus-20240229": "anthropic_claude3"
+  #   "local-mcp-model-name": "mcp_local"
+  #   "mock-model-1": "mock_basic"
