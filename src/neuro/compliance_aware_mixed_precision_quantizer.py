@@ -102,13 +102,13 @@ def tempquant(model, target_module, bits, quant_method='symmetric', per_channel=
                         # Apply different quantization methods
                         if quant_method == 'symmetric':
                             # Symmetric quantization
-                            self._apply_symmetric_quantization(param, bits, per_channel)
+                            _apply_symmetric_quantization(param, bits, per_channel)
                         elif quant_method == 'asymmetric':
                             # Asymmetric quantization
-                            self._apply_asymmetric_quantization(param, bits, per_channel)
+                            _apply_asymmetric_quantization(param, bits, per_channel)
                         elif quant_method == 'power_of_2':
                             # Power of 2 scale quantization (for efficient implementation)
-                            self._apply_power_of_2_quantization(param, bits, per_channel)
+                            _apply_power_of_2_quantization(param, bits, per_channel)
         
         # Yield to allow evaluation of the temporarily quantized model
         yield
