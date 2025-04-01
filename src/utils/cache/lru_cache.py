@@ -1,4 +1,4 @@
-
+    
 class LRUCache:
     """Enhanced LRU Cache with size tracking and statistics"""
     

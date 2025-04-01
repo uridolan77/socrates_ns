@@ -4,7 +4,7 @@ import re
 import torch
 import torch.nn as nn
 from dataclasses import dataclass, field
-from src.utils.text.optimized_semantic_analyzer import OptimizedSemanticAnalyzer
+from src.utils.text.semantic_analyzer import TextSe
 from src.utils.text.token_tracker import TokenTracker
 
 class TokenComplianceGate:

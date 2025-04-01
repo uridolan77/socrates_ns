@@ -1,5 +1,5 @@
 import numpy as np
-from src.compliance.filtering import TextSemanticAnalyzer, TopicModel, EntityTracker, RelationTracker
+from src.utils.text import TextSemanticAnalyzer, TopicModel, EntityTracker, RelationTracker
 
 class SemanticComplianceMonitor:
     """

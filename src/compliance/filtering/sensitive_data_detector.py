@@ -2,6 +2,7 @@ import re
 import logging
 from compliance.models.compliance_issue import ComplianceIssue
 from compliance.filtering.sensitive_token_detector import SensitiveTokenDetector
+
 class SensitiveDataDetector:
     """
     Detects sensitive data patterns like PII in text.
