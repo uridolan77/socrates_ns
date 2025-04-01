@@ -7,7 +7,242 @@ class RuleAdaptationEngine:
     """
     def __init__(self, config):
         self.config = config
+
+    def generate_rules_from_text(self, regulation_text, framework_id):
+        """
+        Generate rules from regulatory text by identifying obligations,
+        prohibitions, and permissions.
         
+        Args:
+            regulation_text: Text of regulatory document
+            framework_id: ID of the regulatory framework
+            
+        Returns:
+            List of generated rules
+        """
+        # Preprocess the text
+        clean_text = self._preprocess_text(regulation_text)
+        sentences = self._split_into_sentences(clean_text)
+        
+        # Categorize sentences
+        sentence_categories = self._categorize_sentences(sentences)
+        
+        # Generate rules for each category
+        rules = []
+        
+        # Generate rules for prohibitions
+        rules.extend(self._generate_prohibition_rules(
+            sentence_categories["prohibitions"], 
+            framework_id
+        ))
+        
+        # Generate rules for obligations
+        rules.extend(self._generate_obligation_rules(
+            sentence_categories["obligations"], 
+            framework_id
+        ))
+        
+        # Generate rules for permissions
+        rules.extend(self._generate_permission_rules(
+            sentence_categories["permissions"], 
+            framework_id
+        ))
+        
+        # Generate rules for disclaimers
+        rules.extend(self._generate_disclaimer_rules(
+            sentence_categories["disclaimers"], 
+            framework_id
+        ))
+        
+        # Generate rules for sensitive data
+        rules.extend(self._generate_sensitive_data_rules(
+            clean_text, 
+            framework_id
+        ))
+        
+        return rules
+
+    def _categorize_sentences(self, sentences):
+        """Categorize sentences by regulatory intent"""
+        # Define indicator terms for different categories
+        prohibition_indicators = [
+            'prohibit', 'forbidden', 'not allowed', 'shall not', 
+            'must not', 'may not', 'cannot', 'restricted', 
+            'prohibited', 'not permitted', 'unlawful'
+        ]
+        
+        obligation_indicators = [
+            'must', 'shall', 'required', 'mandatory', 'obligation', 
+            'requires', 'necessary', 'obligated', 'ensure', 
+            'responsible for', 'duty to', 'need to', 'needs to'
+        ]
+        
+        permission_indicators = [
+            'may', 'permitted', 'allowed', 'can', 'authorized', 
+            'has the right', 'is entitled', 'option to', 
+            'discretion to', 'able to'
+        ]
+        
+        disclaimer_indicators = [
+            'disclose', 'disclosure', 'notice', 'inform', 'statement', 
+            'disclaimer', 'warning', 'caution', 'note that', 
+            'be aware', 'should note'
+        ]
+        
+        # Categorize sentences
+        categories = {
+            "prohibitions": [],
+            "obligations": [],
+            "permissions": [],
+            "disclaimers": [],
+            "others": []
+        }
+        
+        for sentence in sentences:
+            sentence_lower = sentence.lower()
+            
+            # Check for prohibitions (highest priority)
+            if any(indicator in sentence_lower for indicator in prohibition_indicators):
+                categories["prohibitions"].append(sentence)
+                continue
+                
+            # Check for obligations
+            if any(indicator in sentence_lower for indicator in obligation_indicators):
+                categories["obligations"].append(sentence)
+                continue
+                
+            # Check for permissions
+            if any(indicator in sentence_lower for indicator in permission_indicators):
+                categories["permissions"].append(sentence)
+                continue
+                
+            # Check for disclaimers
+            if any(indicator in sentence_lower for indicator in disclaimer_indicators):
+                categories["disclaimers"].append(sentence)
+                continue
+                
+            # Other sentences
+            categories["others"].append(sentence)
+        
+        return categories
+
+    def _generate_prohibition_rules(self, prohibition_sentences, framework_id):
+        """Generate rules from prohibition sentences"""
+        rules = []
+        for i, sentence in enumerate(prohibition_sentences):
+            # Extract prohibited terms or actions
+            prohibited_terms = self._extract_prohibited_terms(sentence)
+            
+            for term in prohibited_terms:
+                rule_id = f"gen_{framework_id}_prohibition_{i}_{len(rules)}"
+                
+                # Create pattern-based rule
+                pattern_rule = {
+                    'id': rule_id,
+                    'name': f"Generated Prohibition: {term}",
+                    'description': f"Generated rule prohibiting {term}",
+                    'type': 'text_pattern',
+                    'subtype': 'prohibited_term',
+                    'action': 'block',
+                    'pattern': self._create_prohibition_pattern(term),
+                    'severity': 'high',  # Prohibitions are typically high severity
+                    'source': 'generated',
+                    'source_text': sentence,
+                    'framework_id': framework_id,
+                    'created_at': datetime.datetime.now().isoformat()
+                }
+                
+                rules.append(pattern_rule)
+                
+                # For more complex terms, also create a semantic rule
+                if len(term.split()) > 1:
+                    semantic_rule = {
+                        'id': f"{rule_id}_semantic",
+                        'name': f"Generated Semantic Prohibition: {term}",
+                        'description': f"Generated semantic rule prohibiting {term}",
+                        'type': 'semantic',
+                        'subtype': 'concept_threshold',
+                        'action': 'block_if_exceeds',
+                        'concept': term,
+                        'threshold': 0.6,
+                        'severity': 'high',
+                        'source': 'generated',
+                        'source_text': sentence,
+                        'framework_id': framework_id,
+                        'created_at': datetime.datetime.now().isoformat()
+                    }
+                    
+                    rules.append(semantic_rule)
+        
+        return rules
+
+    def _extract_prohibited_terms(self, sentence):
+        """Extract prohibited terms or actions from sentence"""
+        # Try NLP-based extraction if available
+        try:
+            import spacy
+            nlp = spacy.load("en_core_web_sm")
+            doc = nlp(sentence)
+            
+            prohibited_terms = []
+            
+            # Look for direct objects of prohibition verbs
+            for token in doc:
+                if token.lemma_ in ['prohibit', 'forbid', 'restrict', 'ban']:
+                    for child in token.children:
+                        if child.dep_ in ['dobj', 'pobj']:
+                            # Get the full phrase
+                            phrase = self._get_phrase_for_token(child, doc)
+                            prohibited_terms.append(phrase)
+            
+            # If no terms found with dependency parsing, use noun chunks after prohibition indicators
+            if not prohibited_terms:
+                for chunk in doc.noun_chunks:
+                    for prohibition_word in ['not', 'cannot', 'prohibited', 'forbidden']:
+                        if prohibition_word in sentence[:chunk.start_char].lower():
+                            prohibited_terms.append(chunk.text)
+                            break
+            
+            # If still no terms, look for verbs after "not" or "cannot"
+            if not prohibited_terms:
+                for token in doc:
+                    if token.pos_ == "VERB" and any(neg in [t.text.lower() for t in token.lefts] for neg in ['not', 'cannot']):
+                        prohibited_terms.append(token.text)
+            
+            # Return unique terms
+            return list(set(prohibited_terms))
+        
+        except (ImportError, OSError):
+            # Fall back to rule-based extraction
+            return self._rule_based_prohibited_extraction(sentence)
+
+    def _create_prohibition_pattern(self, term):
+        """Create regex pattern for prohibited term"""
+        # Escape regex special characters
+        escaped_term = re.escape(term)
+        
+        # For single words, use word boundaries
+        if len(term.split()) == 1:
+            return f"\\b{escaped_term}\\b"
+        else:
+            # For phrases, be a bit more flexible
+            return escaped_term
+
+    def _get_phrase_for_token(self, token, doc):
+        """Get the complete phrase for a token"""
+        # Get all children of this token
+        children = list(token.children)
+        
+        # Sort children by position
+        children.sort(key=lambda x: x.i)
+        
+        # Determine start and end of phrase
+        start = min([token.i] + [child.i for child in children])
+        end = max([token.i] + [child.i for child in children]) + 1
+        
+        # Return the span
+        return doc[start:end].text   
+    
     def generate_rules_from_text(self, regulation_text, framework_id):
         """
         Generate rules from regulatory text

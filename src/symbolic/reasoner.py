@@ -1,3 +1,10 @@
+import datetime
+from typing import Dict, List, Any, Optional, Set, Tuple
+import logging
+import numpy as np
+import z3
+import re
+
 class SymbolicReasoner:
     """
     Symbolic reasoning engine for compliance verification that translates 
@@ -253,3 +260,285 @@ class SymbolicReasoner:
         # Combine and hash
         combined = f"{text_sample}|{frameworks_str}|{context_str}"
         return hashlib.md5(combined.encode()).hexdigest()
+    
+    def _text_to_symbolic(self, text, context=None):
+        """
+        Convert text to symbolic representation for formal logic evaluation.
+        
+        Args:
+            text: Text to convert
+            context: Optional context information
+            
+        Returns:
+            Dictionary containing symbolic representation or None if conversion fails
+        """
+        try:
+            # Extract statements from text
+            statements = []
+            
+            # Simple NLP-based extraction
+            # In a real implementation, this would use more sophisticated NLP
+            sentences = self._split_into_sentences(text)
+            
+            for sentence in sentences:
+                # Extract subject-predicate-object triples
+                triples = self._extract_triples(sentence)
+                statements.extend(triples)
+                
+                # Extract entities and concepts
+                entities = self._extract_entities(sentence)
+                concepts = self._extract_concepts(sentence)
+                
+            return {
+                "statements": statements,
+                "entities": entities,
+                "concepts": concepts,
+                "context": context
+            }
+        except Exception as e:
+            # Log error and return None
+            print(f"Error converting text to symbolic representation: {str(e)}")
+            return None
+
+    def _split_into_sentences(self, text):
+        """Split text into sentences."""
+        import re
+        sentence_endings = r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|\!)\s'
+        sentences = re.split(sentence_endings, text)
+        return [s.strip() for s in sentences if s.strip()]
+
+    def _extract_triples(self, sentence):
+        """Extract subject-predicate-object triples from sentence."""
+        # Simple rule-based extraction
+        # In a real implementation, this would use dependency parsing
+        
+        triples = []
+        
+        # Try simple pattern matching
+        # Subject-verb-object pattern
+        svo_pattern = r'([\w\s]+?)\s+((?:is|are|was|were|has|have|had|do|does|did|will|would|shall|should|may|might|can|could)\s+[\w\s]+?|[\w]+?(?:s|es|ed|ing)?)\s+([\w\s]+)'
+        matches = re.finditer(svo_pattern, sentence, re.IGNORECASE)
+        
+        for match in matches:
+            subject = match.group(1).strip()
+            predicate = match.group(2).strip()
+            obj = match.group(3).strip()
+            
+            if subject and predicate and obj:
+                triples.append({
+                    "subject": subject,
+                    "predicate": predicate,
+                    "object": obj
+                })
+        
+        return triples
+
+    def _extract_entities(self, sentence):
+        """Extract entities from sentence."""
+        # Simple entity extraction
+        # In a real implementation, this would use NER
+        
+        entities = []
+        
+        # Check for known entity patterns
+        # Personal data entities
+        personal_data_patterns = [
+            r'\b[A-Z][a-z]+ [A-Z][a-z]+\b',  # Names
+            r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',  # Emails
+            r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b'  # Phone numbers
+        ]
+        
+        for pattern in personal_data_patterns:
+            matches = re.finditer(pattern, sentence)
+            for match in matches:
+                entities.append({
+                    "type": "PersonalData",
+                    "text": match.group(0),
+                    "position": (match.start(), match.end())
+                })
+        
+        return entities
+
+    def _extract_concepts(self, sentence):
+        """Extract regulatory concepts from sentence."""
+        concepts = []
+        
+        # Check for known regulatory concepts
+        concept_keywords = {
+            "Consent": ["consent", "permission", "authorize", "agree"],
+            "PersonalData": ["personal data", "personal information", "pii"],
+            "ProcessingActivity": ["process", "collect", "store", "use"],
+            "PHI": ["health information", "medical data", "patient data"],
+            "Authorization": ["authorization", "authorized", "approved"]
+        }
+        
+        for concept, keywords in concept_keywords.items():
+            if any(kw in sentence.lower() for kw in keywords):
+                concepts.append(concept)
+        
+        return concepts
+
+    def _evaluate_logical_rule(self, rule_symbolic, symbolic_repr):
+        """
+        Evaluate a rule using formal logic reasoning.
+        
+        Args:
+            rule_symbolic: Symbolic representation of the rule
+            symbolic_repr: Symbolic representation of the text
+            
+        Returns:
+            Dictionary with evaluation results
+        """
+        # This requires z3 or another theorem prover
+        if z3 is None:
+            raise ImportError("z3 library is required for formal logic evaluation")
+        
+        try:
+            # Parse rule into z3 formula
+            rule_formula = self._parse_logic_formula(rule_symbolic)
+            
+            # Convert symbolic representation to z3 constraints
+            facts = self._symbolic_to_constraints(symbolic_repr)
+            
+            # Create solver
+            solver = z3.Solver()
+            
+            # Add facts
+            for fact in facts:
+                solver.add(fact)
+            
+            # Check if facts imply rule (by checking if facts ∧ ¬rule is unsatisfiable)
+            solver.add(z3.Not(rule_formula))
+            
+            if solver.check() == z3.unsat:
+                # Rule is satisfied (facts ∧ ¬rule is unsatisfiable)
+                return {
+                    "is_compliant": True,
+                    "method": "formal_logic",
+                    "confidence": 1.0,
+                    "reasoning": "Formal logic verification passed"
+                }
+            else:
+                # Rule is violated
+                model = solver.model()
+                violation_witness = self._extract_violation_witness(model)
+                
+                return {
+                    "is_compliant": False,
+                    "method": "formal_logic",
+                    "confidence": 1.0,
+                    "reasoning": "Formal logic verification failed",
+                    "violation_details": {
+                        "witness": violation_witness,
+                        "formula": rule_symbolic
+                    }
+                }
+                
+        except Exception as e:
+            # If formal logic evaluation fails, throw exception to fall back to patterns
+            raise Exception(f"Formal logic evaluation failed: {str(e)}")
+
+    def _parse_logic_formula(self, rule_symbolic):
+        """
+        Parse symbolic rule representation into z3 formula.
+        
+        This is a simplified implementation - a real one would use a proper parser
+        for the specific logic formalism used.
+        """
+        # This is a placeholder - actual implementation would parse the formula string
+        if z3 is None:
+            raise ImportError("z3 library is required for parsing logic formulas")
+        
+        # For demonstration, we'll use a hard-coded mapping of formulas
+        if "PersonalData(x)" in rule_symbolic and "Necessary(x)" in rule_symbolic:
+            # Data minimization rule
+            x = z3.Const('x', z3.StringSort())
+            personal_data = z3.Function('PersonalData', z3.StringSort(), z3.BoolSort())
+            adequate = z3.Function('Adequate', z3.StringSort(), z3.BoolSort())
+            relevant = z3.Function('Relevant', z3.StringSort(), z3.BoolSort())
+            necessary = z3.Function('Necessary', z3.StringSort(), z3.BoolSort())
+            
+            return z3.ForAll([x], z3.Implies(personal_data(x), 
+                                        z3.And(adequate(x), relevant(x), necessary(x))))
+        
+        # Default: return a True formula (always satisfied)
+        return z3.BoolVal(True)
+
+    def _symbolic_to_constraints(self, symbolic_repr):
+        """
+        Convert symbolic representation to z3 constraints.
+        
+        This is a simplified implementation - a real one would build constraints
+        based on the full symbolic representation.
+        """
+        if z3 is None:
+            raise ImportError("z3 library is required for creating constraints")
+        
+        constraints = []
+        
+        # Create z3 functions for common predicates
+        x = z3.Const('x', z3.StringSort())
+        personal_data = z3.Function('PersonalData', z3.StringSort(), z3.BoolSort())
+        adequate = z3.Function('Adequate', z3.StringSort(), z3.BoolSort())
+        relevant = z3.Function('Relevant', z3.StringSort(), z3.BoolSort())
+        necessary = z3.Function('Necessary', z3.StringSort(), z3.BoolSort())
+        
+        # Extract entities and concepts
+        entities = symbolic_repr.get("entities", [])
+        concepts = symbolic_repr.get("concepts", [])
+        
+        # Add constraints for personal data entities
+        for entity in entities:
+            if entity.get("type") == "PersonalData":
+                entity_const = z3.StringVal(entity.get("text"))
+                constraints.append(personal_data(entity_const))
+                
+                # Check if context suggests data is not necessary
+                if "collect all" in symbolic_repr.get("context", {}).get("text", "").lower():
+                    constraints.append(z3.Not(necessary(entity_const)))
+        
+        return constraints
+
+    def _extract_violation_witness(self, model):
+        """Extract a human-readable violation witness from z3 model."""
+        # This would extract the specific counterexample from the model
+        # For simplicity, we return a generic message
+        return "Model contains unnecessary personal data"
+
+    def _calculate_compliance_score(self, rule_results, applicable_rules):
+        """Calculate overall compliance score from rule results"""
+        if not rule_results:
+            return 1.0  # Default to compliant if no rules evaluated
+            
+        # Get severity weights for rules
+        severity_weights = {
+            "critical": 1.0,
+            "high": 0.75,
+            "medium": 0.5,
+            "low": 0.25
+        }
+        
+        # Calculate weighted score
+        total_weight = 0
+        weighted_sum = 0
+        
+        for rule_id, result in rule_results.items():
+            rule = self.rules.get(rule_id, {})
+            severity = rule.get("severity", "medium")
+            weight = severity_weights.get(severity, 0.5)
+            
+            # Get compliance result as a score
+            score = 1.0 if result.get("is_compliant", False) else 0.0
+            
+            # Adjust by confidence if available
+            confidence = result.get("confidence", 1.0)
+            score = score * confidence
+            
+            total_weight += weight
+            weighted_sum += weight * score
+        
+        # Normalize score
+        if total_weight > 0:
+            return weighted_sum / total_weight
+        else:
+            return 1.0  # Default to compliant if no weights    

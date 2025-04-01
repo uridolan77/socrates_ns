@@ -31,9 +31,22 @@ from src.compliance.verification.constraint_optimizer import ComplianceConstrain
 from src.interface.optimized_interface import OptimizedNeuralSymbolicInterface
 from src.symbolic.rules.rule_performance_tracker import RulePerformanceTracker
 
-class CompliantLanguageModelProcessor:
+# Import LLM Gateway components
+from src.llm_gateway.core.client import LLMGatewayClient
+from src.llm_gateway.core.models import (
+    LLMRequest, 
+    LLMResponse, 
+    LLMConfig, 
+    InterventionContext,
+    ContentItem,
+    FinishReason,
+    GatewayConfig
+)
+from src.llm_gateway.core.factory import ProviderFactory
+
+class GatewayCompliantLanguageModelProcessor:
     """
-    Compliant Language Model Processor (CLMP) that extends the Neural Processing Module
+    Compliant Language Model Processor (CLMP) that uses the LLM Gateway
     to incorporate language models with integrated regulatory compliance enforcement.
     
     This component enforces compliance at three critical stages:
@@ -41,28 +54,33 @@ class CompliantLanguageModelProcessor:
     2. In-generation: Filtering token probabilities during text generation
     3. Post-generation: Verifying the complete generated text
     """
-    def __init__(self, language_model, neural_symbolic_interface, regulatory_knowledge_base, compliance_config):
+    def __init__(self, gateway_client, neural_symbolic_interface, regulatory_knowledge_base, compliance_config):
         """
         Initialize the CLMP with required components.
         
         Args:
-            language_model: The base language model
+            gateway_client: LLMGatewayClient instance
             neural_symbolic_interface: Interface for bidirectional translation
             regulatory_knowledge_base: Repository of regulatory frameworks
             compliance_config: Configuration parameters for compliance enforcement
         """
-        self.language_model = language_model
+        self.gateway_client = gateway_client
         self.interface = neural_symbolic_interface
         self.regulatory_kb = regulatory_knowledge_base
+        self.compliance_config = compliance_config
         
         # Enhanced components with improved capabilities
         self.compliance_verifier = ComplianceVerifier(compliance_config)
         
         # Initialize specialized compliance components with advanced capabilities
-        self.token_gate = TokenLevelComplianceGate(compliance_config)
+        self.token_gate = OptimizedTokenLevelComplianceGate(
+            language_model=None,  # No direct model reference, using gateway instead
+            regulatory_constraints=self._get_regulatory_constraints(),
+            max_workers=compliance_config.get("max_workers", 8)
+        )
         self.semantic_monitor = SemanticComplianceMonitor(compliance_config)
         self.regulatory_embedding = RegulatoryEmbeddingSpace(
-            language_model.embedding_dim, 
+            compliance_config.get("embedding_dim", 1024), 
             regulatory_knowledge_base
         )
         
@@ -73,16 +91,33 @@ class CompliantLanguageModelProcessor:
         # Add additional components for advanced functionality
         self.violation_analyzer = ViolationAnalyzer(compliance_config)
         self.constraint_optimizer = ComplianceConstraintOptimizer(compliance_config)
+        
+        # Default model identifier for gateway requests
+        self.default_model_identifier = compliance_config.get("default_model", "default_model")
+        
+        # Logging setup
+        self.logger = logging.getLogger(__name__)
+        self.logger.info(f"Initialized GatewayCompliantLanguageModelProcessor with gateway client")
 
-    def generate_compliant_text(self, prompt, context=None, max_tokens=100, compliance_mode='strict'):
+    def _get_regulatory_constraints(self):
+        """Get all applicable regulatory constraints from knowledge base."""
+        # Get all constraints from the regulatory knowledge base
+        if hasattr(self.regulatory_kb, 'get_all_constraints'):
+            return self.regulatory_kb.get_all_constraints()
+        # Fallback to empty list if method doesn't exist
+        return []
+        
+    async def generate_compliant_text_async(self, prompt, context=None, max_tokens=100, compliance_mode='strict', 
+                                           model_identifier=None):
         """
-        Generate text that complies with applicable regulatory frameworks.
+        Generate text that complies with applicable regulatory frameworks asynchronously.
         
         Args:
             prompt: Input text to initiate generation
             context: Additional context information
             max_tokens: Maximum number of tokens to generate
             compliance_mode: 'strict' or 'soft' enforcement
+            model_identifier: Optional model identifier to use
             
         Returns:
             Dict containing generated text, compliance information, and explanations
@@ -101,50 +136,75 @@ class CompliantLanguageModelProcessor:
         applicable_frameworks = pre_generation_result['applicable_frameworks']
         applicable_constraints = pre_generation_result['applicable_constraints']
         
-        # Initialize generation
-        generated_text = ""
-        input_ids = self.tokenize(prompt)
+        # Create LLMRequest object for the Gateway
+        model_id = model_identifier or self.default_model_identifier
         
-        # Initialize semantic compliance state
+        # Initialize InterventionContext with regulatory context
+        intervention_context = InterventionContext(
+            request_id=str(uuid.uuid4()),
+            required_compliance_frameworks=[fw.id for fw in applicable_frameworks],
+            compliance_mode=compliance_mode,
+            user_info={"context": context} if context else {}
+        )
+        
+        # Add semantic state to intervention data if needed
         semantic_state = self.semantic_monitor.initialize(prompt, applicable_frameworks)
+        intervention_context.intervention_data.set("semantic_state", semantic_state)
         
-        # STAGE 2: In-generation compliance enforcement with token-level filtering
-        for i in range(max_tokens):
-            # Get next token logits from language model
-            logits = self.language_model.get_next_token_logits(input_ids)
-            
-            # Apply token-level compliance gate to filter logits
-            filtered_logits = self.token_gate.filter(
-                logits,
-                generated_text,
-                semantic_state,
-                applicable_constraints,
-                compliance_mode
-            )
-            
-            # Sample next token from filtered distribution
-            next_token = self.sample_token(filtered_logits)
-            if self.is_eos_token(next_token):
-                break
-                
-            # Update generated text and input sequence
-            token_text = self.decode_token(next_token)
-            generated_text += token_text
-            input_ids.append(next_token)
-            
-            # Update semantic compliance state
-            semantic_state = self.semantic_monitor.update(
-                semantic_state,
-                token_text,
-                generated_text,
-                applicable_frameworks
-            )
+        # Create config with constraints as metadata
+        llm_config = LLMConfig(
+            model_identifier=model_id,
+            max_tokens=max_tokens,
+            # Add any additional parameters from compliance_config
+            # (temperature, top_p, etc.)
+        )
         
-        # STAGE 3: Post-generation compliance verification
+        # Attach compliance constraints as metadata for custom interventions
+        llm_request = LLMRequest(
+            prompt_content=prompt,
+            config=llm_config,
+            initial_context=intervention_context,
+            # Extensions can be used to pass constraint information to custom interventions
+            extensions={"compliance_constraints": applicable_constraints}
+        )
+        
+        # STAGE 2: Call Gateway to generate text with built-in compliance interventions
+        response = await self.gateway_client.generate(llm_request)
+        
+        # STAGE 3: Post-processing and compliance verification
+        if response.error_details:
+            return {
+                'text': None,
+                'compliance_error': response.error_details.message,
+                'compliance_metadata': {
+                    'code': response.error_details.code,
+                    'level': response.error_details.level,
+                    'provider_details': response.error_details.provider_error_details,
+                    'intervention_details': response.error_details.intervention_error_details
+                }
+            }
+        
+        generated_text = ""
+        if isinstance(response.generated_content, str):
+            generated_text = response.generated_content
+        elif isinstance(response.generated_content, list) and len(response.generated_content) > 0:
+            # Concatenate text content items
+            for item in response.generated_content:
+                if hasattr(item, 'text_content') and item.text_content:
+                    generated_text += item.text_content + " "
+            generated_text = generated_text.strip()
+        
+        # Update semantic state after generation
+        final_semantic_state = response.final_context.intervention_data.get(
+            "semantic_state", semantic_state
+        )
+        
+        # STAGE 4: Final compliance verification
         verification_result = self._perform_post_generation_verification(
             generated_text,
             applicable_frameworks,
-            compliance_mode
+            compliance_mode,
+            final_semantic_state
         )
         
         # Generate explanation if needed
@@ -162,8 +222,35 @@ class CompliantLanguageModelProcessor:
             'compliance_score': verification_result.get('compliance_score', 0.0),
             'modified': verification_result.get('has_modifications', False),
             'explanation': explanation,
-            'compliance_metadata': verification_result.get('metadata', {})
+            'compliance_metadata': verification_result.get('metadata', {}),
+            'usage': response.usage.model_dump() if response.usage else None,
+            'finish_reason': response.finish_reason
         }
+    
+    def generate_compliant_text(self, prompt, context=None, max_tokens=100, compliance_mode='strict', 
+                               model_identifier=None):
+        """
+        Synchronous wrapper for generate_compliant_text_async.
+        
+        Uses asyncio.run() or an event loop to run the async method.
+        """
+        import asyncio
+        
+        try:
+            # Use get_event_loop().run_until_complete() if in an existing event loop
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(
+                self.generate_compliant_text_async(
+                    prompt, context, max_tokens, compliance_mode, model_identifier
+                )
+            )
+        except RuntimeError:
+            # If no event loop is running, create one with asyncio.run()
+            return asyncio.run(
+                self.generate_compliant_text_async(
+                    prompt, context, max_tokens, compliance_mode, model_identifier
+                )
+            )
     
     def _perform_pre_generation_compliance(self, prompt, context, compliance_mode):
         """
@@ -197,7 +284,7 @@ class CompliantLanguageModelProcessor:
         resolved_constraints = self.regulatory_kb.resolve_conflicts(applicable_constraints)
         
         # Project prompt to regulatory embedding space for efficient compliance checking
-        prompt_embedding = self.language_model.get_embeddings(prompt)
+        prompt_embedding = self._get_embeddings(prompt)
         regulatory_embedding = self.regulatory_embedding.project_to_regulatory_space(prompt_embedding)
         
         # Compute initial compliance scores
@@ -222,12 +309,12 @@ class CompliantLanguageModelProcessor:
             }
         }
         
-    def _perform_post_generation_verification(self, text, frameworks, compliance_mode):
+    def _perform_post_generation_verification(self, text, frameworks, compliance_mode, semantic_state=None):
         """
         Verify the complete generated text against all applicable regulatory frameworks.
         """
         # Convert text to neural representation
-        text_embeddings = self.language_model.get_embeddings(text)
+        text_embeddings = self._get_embeddings(text)
         
         # Project to regulatory embedding space
         regulatory_embedding = self.regulatory_embedding.project_to_regulatory_space(text_embeddings)
@@ -262,6 +349,17 @@ class CompliantLanguageModelProcessor:
         )
         
         aggregated_result['overall_compliance_score'] = overall_score
+        
+        # Use semantic state for additional checks if available
+        if semantic_state:
+            semantic_violations = self.semantic_monitor.check_final_state(
+                semantic_state, text, frameworks
+            )
+            if semantic_violations:
+                aggregated_result['semantic_violations'] = semantic_violations
+                # Update compliance if semantic violations found
+                if semantic_violations.get('critical_violation', False):
+                    aggregated_result['is_compliant'] = False
         
         return aggregated_result
         
@@ -314,512 +412,151 @@ class CompliantLanguageModelProcessor:
         
         return overall_score
     
-    # Helper methods for token handling
-    def tokenize(self, text):
-        """Tokenize text using the language model's tokenizer."""
-        return self.language_model.tokenize(text)
-    
-    def decode_token(self, token_id):
-        """Decode a token ID to its string representation."""
-        return self.language_model.decode_token(token_id)
-    
-    def is_eos_token(self, token_id):
-        """Check if a token ID represents an end-of-sequence token."""
-        return token_id == self.language_model.eos_token_id
-    
-    def sample_token(self, logits):
-        """Sample a token from logits using appropriate sampling strategy."""
-        return self.language_model.sample_token(logits)
-
-
-   
-
-    """
-    Enhanced semantic rules with dynamic rule generation and adaptation based on
-    regulatory changes and feedback.
-    """
-    def __init__(self, config):
-        self.config = config
-        self.rule_templates = self._initialize_rule_templates()
-        self.static_rules = self._initialize_static_rules()
-        self.dynamic_rules = {}
-        self.rule_stats = RulePerformanceTracker()
-        self.rule_adaptation_engine = SemanticRuleAdaptationEngine(config)
-        
-    def _initialize_rule_templates(self):
-        """Initialize rule templates for semantic rules"""
-        # Core templates from the base implementation
-        templates = {
-            'concept_threshold': {
-                'type': 'semantic',
-                'subtype': 'concept_threshold',
-                'action': 'block_if_exceeds',
-                'concept_template': "{concept}",
-                'threshold': 0.7,
-                'severity': 'medium'
-            },
-            'topic_restriction': {
-                'type': 'semantic',
-                'subtype': 'topic_restriction',
-                'action': 'block_if_matches',
-                'topic_template': "{topic}",
-                'severity': 'high'
-            },
-            'sentiment_requirement': {
-                'type': 'semantic',
-                'subtype': 'sentiment_requirement',
-                'action': 'require_sentiment',
-                'sentiment_template': "{sentiment}",
-                'threshold': 0.5,
-                'severity': 'low'
-            },
-            'content_classification': {
-                'type': 'semantic',
-                'subtype': 'content_classification',
-                'action': 'classify_and_restrict',
-                'class_template': "{class}",
-                'severity': 'medium'
-            }
-        }
-        
-        # Add advanced templates for more sophisticated rules
-        advanced_templates = {
-            'concept_combination': {
-                'type': 'semantic',
-                'subtype': 'concept_combination',
-                'action': 'flag_if_combined',
-                'concepts': [],
-                'threshold': 0.6,
-                'combination_method': 'all',  # 'all', 'any', 'weighted'
-                'severity': 'medium',
-                'description': 'Flags when multiple concepts appear together'
-            },
-            'concept_contrast': {
-                'type': 'semantic',
-                'subtype': 'concept_contrast',
-                'action': 'flag_if_contrasted',
-                'primary_concept': '',
-                'contrasting_concepts': [],
-                'threshold': 0.6,
-                'severity': 'medium',
-                'description': 'Flags when a concept appears without necessary contrasting concepts'
-            },
-            'semantic_context': {
-                'type': 'semantic',
-                'subtype': 'semantic_context',
-                'action': 'verify_context',
-                'target_concept': '',
-                'required_context': [],
-                'threshold': 0.5,
-                'severity': 'medium',
-                'description': 'Verifies that concepts appear in appropriate semantic contexts'
-            },
-            'regulatory_concept_accuracy': {
-                'type': 'semantic',
-                'subtype': 'regulatory_concept_accuracy',
-                'action': 'verify_accuracy',
-                'regulatory_concept': '',
-                'framework_id': '',
-                'accuracy_threshold': 0.8,
-                'severity': 'high',
-                'description': 'Verifies accurate representation of regulatory concepts'
-            }
-        }
-        
-        # Merge templates
-        templates.update(advanced_templates)
-        
-        # Add custom templates from config
-        custom_templates = self.config.get('custom_semantic_templates', {})
-        for name, template in custom_templates.items():
-            templates[name] = template
-            
-        return templates
-    
-    def _initialize_static_rules(self):
-        """Initialize static rules from configuration or default set"""
-        # Load static rules from configuration
-        config_rules = self.config.get('semantic_rules', {})
-        
-        # Return rules, either from config or empty dict if none provided
-        return config_rules
-    
-    def get_rules_for_framework(self, framework_id):
+    def _get_embeddings(self, text):
         """
-        Get semantic rules for a specific regulatory framework
+        Get embeddings for text using the available embedding model.
+        
+        This implementation should be replaced with a call to an actual embedding model.
+        """
+        # Placeholder implementation - in a real system, this would use the
+        # embedding model associated with the LLM Gateway
+        return np.random.rand(self.compliance_config.get("embedding_dim", 1024))
+    
+    async def stream_compliant_text_async(self, prompt, context=None, max_tokens=100, compliance_mode='strict',
+                                        model_identifier=None):
+        """
+        Stream compliant text generation with gateway.
         
         Args:
-            framework_id: ID of the regulatory framework
+            prompt: Input text to initiate generation
+            context: Additional context information
+            max_tokens: Maximum number of tokens to generate
+            compliance_mode: 'strict' or 'soft' enforcement
+            model_identifier: Optional model identifier to use
             
         Returns:
-            List of semantic rules for the framework
+            Async generator that yields chunks of generated text with compliance info
         """
-        # Get static rules for this framework
-        static_framework_rules = self._get_static_rules_for_framework(framework_id)
+        # STAGE 1: Pre-generation compliance analysis
+        pre_generation_result = self._perform_pre_generation_compliance(prompt, context, compliance_mode)
         
-        # Get dynamic rules for this framework
-        dynamic_framework_rules = self._get_dynamic_rules_for_framework(framework_id)
+        if not pre_generation_result['is_compliant']:
+            yield {
+                'text': None,
+                'is_compliant': False,
+                'is_finished': True,
+                'compliance_error': pre_generation_result.get('error', 'Failed pre-generation compliance check'),
+                'compliance_metadata': pre_generation_result.get('metadata', {})
+            }
+            return
         
-        # Generate rules based on regulation text if available
-        generated_rules = self._generate_rules_from_regulation(framework_id)
+        # Extract applicable frameworks and constraints
+        applicable_frameworks = pre_generation_result['applicable_frameworks']
+        applicable_constraints = pre_generation_result['applicable_constraints']
         
-        # Combine rules with dynamic rules taking precedence over static if IDs clash
-        combined_rules = self._combine_rules(
-            static_framework_rules, dynamic_framework_rules, generated_rules
+        # Create LLMRequest object for the Gateway
+        model_id = model_identifier or self.default_model_identifier
+        
+        # Initialize InterventionContext with regulatory context
+        intervention_context = InterventionContext(
+            request_id=str(uuid.uuid4()),
+            required_compliance_frameworks=[fw.id for fw in applicable_frameworks],
+            compliance_mode=compliance_mode,
+            user_info={"context": context} if context else {}
         )
         
-        # Update rule stats
-        self.rule_stats.record_rule_usage(framework_id, combined_rules)
+        # Add semantic state to intervention data
+        semantic_state = self.semantic_monitor.initialize(prompt, applicable_frameworks)
+        intervention_context.intervention_data.set("semantic_state", semantic_state)
         
-        return combined_rules
-    
-    def _get_static_rules_for_framework(self, framework_id):
-        """Get static rules for a specific framework"""
-        # Check if framework rules exist
-        if framework_id in self.static_rules:
-            return self.static_rules[framework_id]
-            
-        # Framework not found, return empty list
-        return []
-    
-    def _get_dynamic_rules_for_framework(self, framework_id):
-        """Get dynamic rules for a specific framework"""
-        # Check if dynamic framework rules exist
-        if framework_id in self.dynamic_rules:
-            return self.dynamic_rules[framework_id]
-            
-        # Initialize empty dynamic rule list for this framework
-        self.dynamic_rules[framework_id] = []
-        return []
-    
-    def _generate_rules_from_regulation(self, framework_id):
-        """Generate rules from regulatory text if available"""
-        # Check if regulatory text is available
-        reg_text_provider = self.config.get('regulatory_text_provider')
-        if not reg_text_provider:
-            return []
-            
-        try:
-            # Get regulation text
-            reg_text = reg_text_provider.get_regulation_text(framework_id)
-            if not reg_text:
-                return []
-                
-            # Use rule generation engine to create rules
-            generated_rules = self.rule_adaptation_engine.generate_rules_from_text(
-                reg_text, framework_id
-            )
-            
-            return generated_rules
-        except Exception as e:
-            logging.warning(f"Error generating semantic rules from regulation: {str(e)}")
-            return []
-    
-    def _combine_rules(self, static_rules, dynamic_rules, generated_rules):
-        """Combine rules, handling conflicts with priority order"""
-        # Implementation similar to DynamicTextPatternRules._combine_rules
-        all_rules = []
-        rule_ids = set()
-        
-        # Add generated rules (lowest priority)
-        for rule in generated_rules:
-            rule_id = rule.get('id')
-            if rule_id not in rule_ids:
-                all_rules.append(rule)
-                rule_ids.add(rule_id)
-                
-        # Add static rules (middle priority)
-        for rule in static_rules:
-            rule_id = rule.get('id')
-            if rule_id not in rule_ids:
-                all_rules.append(rule)
-                rule_ids.add(rule_id)
-            else:
-                # Replace generated rule with static rule
-                for i, existing_rule in enumerate(all_rules):
-                    if existing_rule.get('id') == rule_id:
-                        all_rules[i] = rule
-                        break
-                        
-        # Add dynamic rules (highest priority)
-        for rule in dynamic_rules:
-            rule_id = rule.get('id')
-            if rule_id not in rule_ids:
-                all_rules.append(rule)
-                rule_ids.add(rule_id)
-            else:
-                # Replace existing rule with dynamic rule
-                for i, existing_rule in enumerate(all_rules):
-                    if existing_rule.get('id') == rule_id:
-                        all_rules[i] = rule
-                        break
-                        
-        return all_rules
-    
-    def get_conflict_resolution_strategy(self):
-        """Get conflict resolution strategy for semantic rules"""
-        # Default strategy
-        default_strategy = {
-            'priority': 'most_specific',
-            'resolution_method': 'combine_conditions',
-            'threshold_handling': 'take_lowest'
-        }
-        
-        # Get custom strategy from config if available
-        custom_strategy = self.config.get('semantic_conflict_strategy')
-        if custom_strategy:
-            return {**default_strategy, **custom_strategy}
-            
-        return default_strategy
-    
-    def create_rule(self, template_name, parameters, framework_id=None, rule_id=None):
-        """
-        Create a new rule based on a template
-        
-        Args:
-            template_name: Name of the template to use
-            parameters: Parameters to apply to template
-            framework_id: Optional framework to associate with rule
-            rule_id: Optional explicit rule ID
-            
-        Returns:
-            Created rule or None if creation failed
-        """
-        # Implementation similar to DynamicTextPatternRules.create_rule
-        # Check if template exists
-        if template_name not in self.rule_templates:
-            logging.warning(f"Template '{template_name}' not found")
-            return None
-            
-        # Get template
-        template = self.rule_templates[template_name]
-        
-        # Generate rule
-        try:
-            rule = self._generate_rule_from_template(template, parameters, rule_id)
-            
-            # Add rule to dynamic rules
-            if framework_id:
-                if framework_id not in self.dynamic_rules:
-                    self.dynamic_rules[framework_id] = []
-                self.dynamic_rules[framework_id].append(rule)
-            else:
-                # Add to generic rules
-                if 'GENERIC' not in self.dynamic_rules:
-                    self.dynamic_rules['GENERIC'] = []
-                self.dynamic_rules['GENERIC'].append(rule)
-                
-            # Record rule creation
-            self.rule_stats.record_rule_creation(rule.get('id'), framework_id)
-            
-            return rule
-        except Exception as e:
-            logging.warning(f"Error creating semantic rule: {str(e)}")
-            return None
-    
-    def _generate_rule_from_template(self, template, parameters, rule_id=None):
-        """Generate a rule by applying parameters to a template"""
-        # Create a copy of the template
-        rule = template.copy()
-        
-        # Generate ID if not provided
-        if not rule_id:
-            rule_id = f"semantic_rule_{uuid.uuid4().hex[:8]}"
-            
-        # Add ID to rule
-        rule['id'] = rule_id
-        
-        # Apply concept template if exists
-        for template_field in ['concept_template', 'topic_template', 'sentiment_template', 'class_template']:
-            if template_field in rule:
-                field_name = template_field.split('_')[0]  # concept, topic, etc.
-                template_value = rule[template_field]
-                
-                if f"{{{field_name}}}" in template_value:
-                    if field_name in parameters:
-                        rule[field_name] = template_value.replace(f"{{{field_name}}}", parameters[field_name])
-                
-                # Remove template field
-                del rule[template_field]
-                
-        # Apply other parameters directly
-        for param_name, param_value in parameters.items():
-            if param_name not in rule:
-                rule[param_name] = param_value
-                
-        # Add creation timestamp
-        rule['created_at'] = datetime.datetime.now().isoformat()
-        
-        return rule
-    
-    def update_rule(self, rule_id, updates, framework_id=None):
-        """
-        Update an existing rule
-        
-        Args:
-            rule_id: ID of rule to update
-            updates: Dictionary of updates to apply
-            framework_id: Optional framework ID to limit search
-            
-        Returns:
-            Updated rule or None if update failed
-        """
-        # Implementation similar to DynamicTextPatternRules.update_rule
-        # Find the rule
-        rule_found = False
-        updated_rule = None
-        
-        # Check dynamic rules
-        if framework_id:
-            frameworks_to_check = [framework_id]
-        else:
-            frameworks_to_check = list(self.dynamic_rules.keys())
-            
-        for fw_id in frameworks_to_check:
-            for i, rule in enumerate(self.dynamic_rules.get(fw_id, [])):
-                if rule.get('id') == rule_id:
-                    # Apply updates
-                    for key, value in updates.items():
-                        rule[key] = value
-                        
-                    # Update timestamp
-                    rule['updated_at'] = datetime.datetime.now().isoformat()
-                    
-                    # Update rule in dynamic rules
-                    self.dynamic_rules[fw_id][i] = rule
-                    updated_rule = rule
-                    rule_found = True
-                    break
-                    
-            if rule_found:
-                break
-                
-        # Check static rules if not found in dynamic
-        if not rule_found:
-            for fw_id, rules in self.static_rules.items():
-                if framework_id and fw_id != framework_id:
-                    continue
-                    
-                for i, rule in enumerate(rules):
-                    if rule.get('id') == rule_id:
-                        # Create dynamic rule from static with updates
-                        new_rule = rule.copy()
-                        for key, value in updates.items():
-                            new_rule[key] = value
-                            
-                        # Add timestamps
-                        new_rule['created_at'] = datetime.datetime.now().isoformat()
-                        new_rule['updated_at'] = datetime.datetime.now().isoformat()
-                        new_rule['derived_from'] = rule_id
-                        
-                        # Add to dynamic rules
-                        if fw_id not in self.dynamic_rules:
-                            self.dynamic_rules[fw_id] = []
-                        self.dynamic_rules[fw_id].append(new_rule)
-                        updated_rule = new_rule
-                        rule_found = True
-                        break
-                        
-                if rule_found:
-                    break
-                    
-        # Record update if successful
-        if updated_rule:
-            self.rule_stats.record_rule_update(rule_id, framework_id)
-            
-        return updated_rule
-    
-    def delete_rule(self, rule_id, framework_id=None):
-        """
-        Delete a dynamic rule
-        
-        Args:
-            rule_id: ID of rule to delete
-            framework_id: Optional framework ID to limit search
-            
-        Returns:
-            True if rule was deleted, False otherwise
-        """
-        # Implementation similar to DynamicTextPatternRules.delete_rule
-        # Only dynamic rules can be deleted
-        if framework_id:
-            frameworks_to_check = [framework_id]
-        else:
-            frameworks_to_check = list(self.dynamic_rules.keys())
-            
-        for fw_id in frameworks_to_check:
-            for i, rule in enumerate(self.dynamic_rules.get(fw_id, [])):
-                if rule.get('id') == rule_id:
-                    # Remove rule
-                    del self.dynamic_rules[fw_id][i]
-                    
-                    # Record deletion
-                    self.rule_stats.record_rule_deletion(rule_id, fw_id)
-                    
-                    return True
-                    
-        return False
-    
-    def adapt_rules_based_on_feedback(self, feedback_data):
-        """
-        Adapt rules based on feedback data
-        
-        Args:
-            feedback_data: Dictionary with feedback on rule performance
-            
-        Returns:
-            List of rule adaptations made
-        """
-        # Use rule adaptation engine to adapt rules
-        adaptations = self.rule_adaptation_engine.adapt_rules(
-            feedback_data, self.dynamic_rules, self.static_rules, self.rule_stats
+        # Create config with constraints as metadata
+        llm_config = LLMConfig(
+            model_identifier=model_id,
+            max_tokens=max_tokens,
+            # Add any additional parameters
         )
         
-        # Apply adaptations
-        for adaptation in adaptations:
-            adaptation_type = adaptation.get('type')
-            
-            if adaptation_type == 'update':
-                self.update_rule(
-                    adaptation['rule_id'], 
-                    adaptation['updates'],
-                    adaptation.get('framework_id')
-                )
-            elif adaptation_type == 'create':
-                self.create_rule(
-                    adaptation['template_name'],
-                    adaptation['parameters'],
-                    adaptation.get('framework_id'),
-                    adaptation.get('rule_id')
-                )
-            elif adaptation_type == 'delete':
-                self.delete_rule(
-                    adaptation['rule_id'],
-                    adaptation.get('framework_id')
+        # Create streaming request
+        llm_request = LLMRequest(
+            prompt_content=prompt,
+            config=llm_config,
+            initial_context=intervention_context,
+            stream=True,  # Enable streaming
+            extensions={"compliance_constraints": applicable_constraints}
+        )
+        
+        # STAGE 2: Stream generated text through gateway
+        # Accumulate generated text for final verification
+        accumulated_text = ""
+        finish_reason = None
+        
+        try:
+            async for chunk in self.gateway_client.generate_stream(llm_request):
+                # Process chunk
+                delta_text = chunk.delta_text or ""
+                accumulated_text += delta_text
+                
+                # Track finish reason
+                if chunk.finish_reason:
+                    finish_reason = chunk.finish_reason
+                    
+                # Yield chunk with intermediate compliance info
+                yield {
+                    'text_chunk': delta_text,
+                    'accumulated_text': accumulated_text,
+                    'is_compliant': True,  # Intermediate compliance
+                    'is_finished': chunk.finish_reason is not None,
+                    'finish_reason': chunk.finish_reason,
+                    'usage': chunk.usage_update.model_dump() if chunk.usage_update else None
+                }
+                
+            # STAGE 3: Final compliance verification after stream completes
+            if accumulated_text:
+                verification_result = self._perform_post_generation_verification(
+                    accumulated_text,
+                    applicable_frameworks,
+                    compliance_mode
                 )
                 
-        return adaptations
-    
-    def get_rule_performance_report(self, framework_id=None):
+                # Send final chunk with compliance verification
+                yield {
+                    'text_chunk': "",
+                    'accumulated_text': accumulated_text,
+                    'is_compliant': verification_result['is_compliant'],
+                    'is_finished': True,
+                    'finish_reason': finish_reason,
+                    'compliance_score': verification_result.get('compliance_score', 0.0),
+                    'compliance_metadata': verification_result.get('metadata', {})
+                }
+                
+        except Exception as e:
+            self.logger.error(f"Error during streaming generation: {str(e)}")
+            yield {
+                'text_chunk': "",
+                'accumulated_text': accumulated_text,
+                'is_compliant': False,
+                'is_finished': True,
+                'compliance_error': f"Error during streaming: {str(e)}",
+                'compliance_metadata': {'error': str(e)}
+            }
+
+
+class EnhancedGatewayCompliantLanguageProcessor:
+    """
+    Enhanced implementation that uses the LLM Gateway for generation
+    while incorporating optimized compliance techniques.
+    """
+    def __init__(self, gateway_client, config):
         """
-        Get report on rule performance
+        Initialize the enhanced processor with gateway client.
         
         Args:
-            framework_id: Optional framework ID to limit report
-            
-        Returns:
-            Report on rule performance
+            gateway_client: LLMGatewayClient instance
+            config: Configuration dictionary
         """
-        return self.rule_stats.generate_report(framework_id)
-
-class EnhancedCompliantLanguageProcessor:
-    """
-    Enhanced implementation that combines the best optimization techniques
-    from both sets of recommendations
-    """
-    def __init__(self, config):
         # System configuration
         self.config = config
+        self.gateway_client = gateway_client
         
         # Initialize component registry with domain specialists
         self.model_registry = ComplianceModelRegistry()
@@ -828,10 +565,9 @@ class EnhancedCompliantLanguageProcessor:
         # Initialize optimized knowledge base with efficient indexing
         self.regulatory_kb = self._initialize_optimized_knowledge_base()
         
-        # Initialize main language model and quantized embedding space
-        self.llm = self._initialize_optimized_llm()
+        # Initialize quantized embedding space
         self.regulatory_embedding = QuantizedRegulatoryEmbeddingSpace(
-            embedding_dim=self.llm.embedding_dim,
+            embedding_dim=config.get("embedding_dim", 1024),
             regulatory_knowledge_base=self.regulatory_kb,
             quantization_bits=8
         )
@@ -839,14 +575,14 @@ class EnhancedCompliantLanguageProcessor:
         # Initialize neural-symbolic interface with bidirectional optimization
         self.interface = OptimizedNeuralSymbolicInterface(
             base_interface=None,
-            language_model=self.llm,
+            language_model=None,  # Use gateway instead of direct model
             regulatory_knowledge_base=self.regulatory_kb
         )
         
         # Initialize compliance components with parallelization
         self.input_filter = ParallelCompliancePrefilter(self.config["input_filtering"])
         self.token_gate = OptimizedTokenLevelComplianceGate(
-            language_model=self.llm,
+            language_model=None,  # Use gateway instead of direct model
             regulatory_constraints=self.regulatory_kb.get_all_constraints(),
             max_workers=self.config.get("max_workers", 8)
         )
@@ -863,11 +599,11 @@ class EnhancedCompliantLanguageProcessor:
         # Initialize RAG components with context-aware retrieval
         self.retriever = OptimizedRegulatoryRetrieval(
             regulatory_document_store=self.regulatory_kb.document_store,
-            embedding_model=self.llm
+            embedding_model=None  # Will use gateway for embeddings
         )
         self.augmenter = EfficientRegulationAugmenter(
             regulatory_retriever=self.retriever,
-            language_model=self.llm
+            language_model=None  # Will use gateway for embeddings
         )
         
         # Initialize performance monitoring and dynamic optimization
@@ -880,12 +616,32 @@ class EnhancedCompliantLanguageProcessor:
         self._constraint_cache = LRUCache(maxsize=1000)
         self._framework_cache = LRUCache(maxsize=500)
         
+        # Default model identifier for gateway requests
+        self.default_model_identifier = config.get("default_model", "default_model")
+        
         # Start performance monitoring
         self.performance_optimizer.start_monitoring()
+        
+        # Logging setup
+        self.logger = logging.getLogger(__name__)
+        self.logger.info(f"Initialized EnhancedGatewayCompliantLanguageProcessor with gateway client")
 
-    def generate_compliant_text(self, prompt, context=None, compliance_mode='strict',
-                               max_tokens=100, rag_enabled=True):
-        """Generate text with optimized compliance enforcement"""
+    async def generate_compliant_text(self, prompt, context=None, compliance_mode='strict',
+                                    max_tokens=100, rag_enabled=True, model_identifier=None):
+        """
+        Generate text with optimized compliance enforcement using the gateway.
+        
+        Args:
+            prompt: Input prompt text
+            context: Additional context information
+            compliance_mode: Compliance strictness mode
+            max_tokens: Maximum tokens to generate
+            rag_enabled: Whether to use RAG augmentation
+            model_identifier: Optional model identifier
+            
+        Returns:
+            Dict with generated text and compliance info
+        """
         try:
             # Analyze request to determine optimal processing strategy
             processing_strategy = self._determine_optimal_strategy(prompt, context)
@@ -900,19 +656,15 @@ class EnhancedCompliantLanguageProcessor:
                 )
             
             # STAGE 2: Select optimal model based on context and constraints
-            selected_model = self._select_optimal_model(
+            model_id = model_identifier or self._select_optimal_model(
                 processing_strategy, prompt, context, compliance_mode
             )
             
             # STAGE 3: Context-aware RAG augmentation if enabled
             if rag_enabled:
-                augmented_prompt, used_regulations = self.augmenter.augment_prompt(
+                augmented_prompt, used_regulations = self._simulate_augmentation(
                     input_filter_result['filtered_input'], 
-                    context,
-                    available_tokens=self._calculate_available_tokens(
-                        input_filter_result['filtered_input'],
-                        selected_model
-                    )
+                    context
                 )
             else:
                 augmented_prompt = input_filter_result['filtered_input']
@@ -931,19 +683,65 @@ class EnhancedCompliantLanguageProcessor:
                 augmented_prompt, applicable_frameworks
             )
             
-            # STAGE 6: Generate text with parallel constraint enforcement
-            generation_result = self._generate_with_constraints(
-                selected_model,
-                augmented_prompt,
-                semantic_state,
-                applicable_constraints,
-                max_tokens,
-                compliance_mode
+            # STAGE 6: Generate text through the gateway
+            # Prepare intervention context with regulatory information
+            intervention_context = InterventionContext(
+                request_id=str(uuid.uuid4()),
+                required_compliance_frameworks=[fw.id for fw in applicable_frameworks],
+                compliance_mode=compliance_mode,
+                user_info={"context": context} if context else {}
             )
+            
+            # Add semantic state to intervention data
+            intervention_context.intervention_data.set("semantic_state", semantic_state)
+            
+            # Create config with constraints as metadata
+            llm_config = LLMConfig(
+                model_identifier=model_id,
+                max_tokens=max_tokens,
+                # Add any additional parameters from the strategy
+                temperature=self._get_temperature_for_strategy(processing_strategy)
+            )
+            
+            # Create request with strategy and constraint information
+            llm_request = LLMRequest(
+                prompt_content=augmented_prompt,
+                config=llm_config,
+                initial_context=intervention_context,
+                # Pass strategy and constraints through extensions
+                extensions={
+                    "compliance_constraints": applicable_constraints,
+                    "processing_strategy": processing_strategy
+                }
+            )
+            
+            # Generate through gateway
+            response = await self.gateway_client.generate(llm_request)
+            
+            if response.error_details:
+                return self._format_compliance_error(
+                    response.error_details.message,
+                    {
+                        'code': response.error_details.code,
+                        'level': response.error_details.level,
+                        'provider_details': response.error_details.provider_error_details
+                    }
+                )
+            
+            # Extract generated text
+            generated_text = ""
+            if isinstance(response.generated_content, str):
+                generated_text = response.generated_content
+            elif isinstance(response.generated_content, list) and len(response.generated_content) > 0:
+                # Concatenate text content items
+                for item in response.generated_content:
+                    if hasattr(item, 'text_content') and item.text_content:
+                        generated_text += item.text_content + " "
+                generated_text = generated_text.strip()
             
             # STAGE 7: Verify output with proof tracing
             verification_result, proof_trace = self.compliance_verifier.verify_with_proof(
-                generation_result['text'],
+                generated_text,
                 applicable_frameworks,
                 compliance_mode
             )
@@ -952,12 +750,12 @@ class EnhancedCompliantLanguageProcessor:
             explanation = None
             if not verification_result['is_compliant'] or verification_result.get('has_modifications', False):
                 explanation = self._generate_explanation_from_proof(
-                    proof_trace, prompt, generation_result['text']
+                    proof_trace, prompt, generated_text
                 )
             
             # Construct final result
             return {
-                'text': generation_result['text'],
+                'text': generated_text,
                 'is_compliant': verification_result['is_compliant'],
                 'compliance_score': verification_result.get('compliance_score', 0.0),
                 'modified': verification_result.get('has_modifications', False),
@@ -968,13 +766,15 @@ class EnhancedCompliantLanguageProcessor:
                     'constraints_count': len(applicable_constraints),
                     'used_regulations': used_regulations,
                     'processing_strategy': processing_strategy,
-                    'selected_model': getattr(selected_model, 'id', 'default'),
+                    'selected_model': model_id,
                     'verification_details': verification_result.get('metadata', {})
-                }
+                },
+                'usage': response.usage.model_dump() if response.usage else None,
+                'finish_reason': response.finish_reason
             }
             
         except Exception as e:
-            logging.error(f"Error in compliant text generation: {str(e)}")
+            self.logger.error(f"Error in compliant text generation: {str(e)}")
             traceback.print_exc()
             return self._format_compliance_error(
                 f"Internal error: {str(e)}",
@@ -996,15 +796,38 @@ class EnhancedCompliantLanguageProcessor:
             return "hybrid"  # Use hybrid approach
     
     def _select_optimal_model(self, strategy, prompt, context, compliance_mode):
-        """Select optimal model based on processing strategy and constraints"""
+        """
+        Select optimal model identifier based on strategy and constraints.
+        
+        Returns the model identifier string to use with the gateway.
+        """
         if strategy == "lightweight":
             # Try to find appropriate specialist model
             domain = self._detect_regulatory_domain(prompt, context)
             if domain and domain in self.model_registry.models:
-                return self.model_registry.models[domain]["model"]
+                specialist_model = self.model_registry.models[domain]["model"]
+                return f"{domain}_specialist"
         
-        # Default to main LLM for full compliance or when no specialist is available
-        return self.llm
+        # Default to configured model for full compliance or when no specialist is available
+        return self.default_model_identifier
+    
+    def _get_temperature_for_strategy(self, strategy):
+        """Get appropriate temperature value for the given strategy"""
+        if strategy == "lightweight":
+            return 0.7  # Higher creativity for non-critical content
+        elif strategy == "full_compliance":
+            return 0.2  # More conservative for high-compliance needs
+        else:
+            return 0.5  # Balanced approach
+    
+    def _simulate_augmentation(self, prompt, context):
+        """
+        Simulate prompt augmentation with regulatory content.
+        
+        In a real implementation, this would use the EfficientRegulationAugmenter.
+        """
+        # Placeholder implementation - would actually use the augmenter
+        return prompt, ["GDPR_Article_5", "HIPAA_Section_164"]
     
     def _get_applicable_frameworks(self, prompt, context, compliance_mode):
         """Get applicable frameworks with caching optimization"""
@@ -1044,29 +867,6 @@ class EnhancedCompliantLanguageProcessor:
         # Cache result
         self._constraint_cache[cache_key] = resolved_constraints
         return resolved_constraints
-    
-    def _generate_with_constraints(self, model, prompt, semantic_state, constraints, 
-                                  max_tokens, compliance_mode):
-        """Generate text with optimized constraint enforcement"""
-        if hasattr(model, 'generate_compliant_text'):
-            # Use model's built-in compliance capability if available
-            return model.generate_compliant_text(
-                prompt, 
-                semantic_state=semantic_state,
-                constraints=constraints,
-                max_tokens=max_tokens,
-                compliance_mode=compliance_mode
-            )
-        else:
-            # Use token gate for constraint enforcement
-            return self.token_gate.generate_compliant_text(
-                model,
-                prompt,
-                semantic_state=semantic_state,
-                constraints=constraints,
-                max_tokens=max_tokens,
-                compliance_mode=compliance_mode
-            )
     
     def _generate_explanation_from_proof(self, proof_trace, prompt, generated_text):
         """Generate explanation from proof trace with enhanced detail"""
@@ -1116,192 +916,117 @@ class EnhancedCompliantLanguageProcessor:
             'compliance_metadata': metadata
         }
     
-    def clear_caches(self):
-        """Clear all caches for testing or memory management"""
-        self._constraint_cache.clear()
-        self._framework_cache.clear()
-        self.interface.neural_to_symbolic_cache.clear()
-        self.interface.symbolic_to_neural_cache.clear()
+    def _analyze_complexity(self, prompt):
+        """
+        Analyze complexity of the prompt to determine optimal processing strategy.
         
-    def _calculate_available_tokens(self, prompt, model):
-        """Calculate available tokens for RAG augmentation"""
-        prompt_tokens = len(self.llm.tokenize(prompt))
-        if hasattr(model, 'get_context_size'):
-            context_size = model.get_context_size()
+        Args:
+            prompt: Input prompt text
+            
+        Returns:
+            Complexity score (0-1)
+        """
+        # In a real implementation, this would analyze various complexity factors
+        # Simplified implementation based on length and structure
+        
+        # Length factor (longer prompts are more complex)
+        length = len(prompt)
+        length_factor = min(length / 1000, 1.0)
+        
+        # Structure factor (prompts with questions are more complex)
+        question_factor = 0.3 if "?" in prompt else 0.0
+        
+        # Topic factor (certain topics increase complexity)
+        complex_topics = ["compliance", "regulation", "legal", "technical", "medical"]
+        topic_matches = sum(1 for topic in complex_topics if topic.lower() in prompt.lower())
+        topic_factor = min(topic_matches * 0.15, 0.5)
+        
+        # Combine factors
+        complexity = (0.5 * length_factor) + (0.3 * question_factor) + (0.2 * topic_factor)
+        
+        return min(complexity, 1.0)
+        
+    def _analyze_regulatory_specificity(self, context):
+        """
+        Analyze regulatory specificity of the context.
+        
+        Args:
+            context: Context information
+            
+        Returns:
+            Regulatory specificity score (0-1)
+        """
+        # If no context, low specificity
+        if not context:
+            return 0.1
+            
+        # Convert context to string if it's a dictionary
+        if isinstance(context, dict):
+            context_str = str(context)
         else:
-            context_size = 4096  # Default assumption
+            context_str = str(context)
             
-        # Reserve tokens for response
-        reserved_tokens = min(context_size // 3, 1000)
+        # Check for regulatory framework mentions
+        frameworks = ["GDPR", "HIPAA", "FINREG", "CCPA", "PCI DSS", "SOX"]
+        framework_matches = sum(1 for fw in frameworks if fw in context_str)
+        framework_factor = min(framework_matches * 0.2, 0.6)
         
-        # Calculate available tokens with safety margin
-        available = context_size - prompt_tokens - reserved_tokens - 50
-        return max(available, 0)  # Ensure non-negative
-
-
-    def _create_pruned_specialist(self, domain):
+        # Check for regulatory concept mentions
+        concepts = ["compliance", "regulation", "privacy", "security", "consent", "data subject"]
+        concept_matches = sum(1 for concept in concepts if concept.lower() in context_str.lower())
+        concept_factor = min(concept_matches * 0.1, 0.4)
+        
+        # Combine factors
+        specificity = (0.7 * framework_factor) + (0.3 * concept_factor)
+        
+        return min(specificity, 1.0)
+        
+    def _detect_regulatory_domain(self, prompt, context):
         """
-        Create a progressively pruned specialist model for a specific regulatory domain.
+        Detect relevant regulatory domain for the request.
         
         Args:
-            domain: Regulatory domain (e.g., "GDPR")
+            prompt: Input prompt text
+            context: Context information
             
         Returns:
-            Pruned specialist model
+            Detected domain or None
         """
-        # In a real implementation, this would load and prune a pre-trained model
-        # Placeholder implementation
-        class PrunedSpecialistModel:
-            def __init__(self, domain):
-                self.domain = domain
-                self.id = f"{domain}_pruned_specialist"
-                self.embedding_dim = 768
+        # Combine prompt and context for analysis
+        combined_text = prompt
+        if context:
+            if isinstance(context, dict):
+                combined_text += " " + str(context)
+            else:
+                combined_text += " " + context
                 
-            def generate_compliant_text(self, prompt, semantic_state=None, constraints=None, 
-                                    max_tokens=100, compliance_mode="standard"):
-                # Specialist model with built-in compliance for domain
-                return {
-                    "text": f"Compliant response for {self.domain} query",
-                    "is_compliant": True,
-                    "compliance_score": 0.95
-                }
-                
-            def get_embeddings(self, text):
-                # Placeholder embedding generation
-                return np.random.randn(self.embedding_dim)
-                
-            def get_context_size(self):
-                return 2048  # Smaller context size than base model
-                
-        return PrunedSpecialistModel(domain)
+        combined_text = combined_text.lower()
         
-    def _create_quantized_specialist(self, domain):
-        """
-        Create a quantized specialist model for a specific regulatory domain.
+        # Check for domain-specific indicators
+        domain_indicators = {
+            "GDPR": ["gdpr", "personal data", "data subject", "privacy", "consent", "eu regulation"],
+            "HIPAA": ["hipaa", "health", "medical", "patient", "phi", "healthcare"],
+            "FINREG": ["financial", "banking", "aml", "kyc", "transaction", "money laundering"]
+        }
         
-        Args:
-            domain: Regulatory domain (e.g., "HIPAA")
+        # Score each domain
+        domain_scores = {}
+        for domain, indicators in domain_indicators.items():
+            score = sum(combined_text.count(indicator) for indicator in indicators)
+            domain_scores[domain] = score
             
-        Returns:
-            Quantized specialist model
-        """
-        # In a real implementation, this would load and quantize a pre-trained model
-        # Placeholder implementation
-        class QuantizedSpecialistModel:
-            def __init__(self, domain):
-                self.domain = domain
-                self.id = f"{domain}_quantized_specialist"
-                self.embedding_dim = 768
-                self.quantization_bits = 8
-                
-            def generate_compliant_text(self, prompt, semantic_state=None, constraints=None, 
-                                    max_tokens=100, compliance_mode="standard"):
-                # Specialist model with built-in compliance for domain
-                return {
-                    "text": f"Compliant response for {self.domain} query with quantized precision",
-                    "is_compliant": True,
-                    "compliance_score": 0.92
-                }
-                
-            def get_embeddings(self, text):
-                # Placeholder embedding generation
-                return np.random.randn(self.embedding_dim)
-                
-            def get_context_size(self):
-                return 4096
-                
-        return QuantizedSpecialistModel(domain)
-        
-    def _create_distilled_specialist(self, domain):
-        """
-        Create a knowledge-distilled specialist model for a specific regulatory domain.
-        
-        Args:
-            domain: Regulatory domain (e.g., "FINREG")
+        # Get domain with highest score
+        if not domain_scores:
+            return None
             
-        Returns:
-            Distilled specialist model
-        """
-        # In a real implementation, this would load a knowledge-distilled model
-        # Placeholder implementation
-        class DistilledSpecialistModel:
-            def __init__(self, domain):
-                self.domain = domain
-                self.id = f"{domain}_distilled_specialist"
-                self.embedding_dim = 384  # Smaller embedding dimension due to distillation
-                
-            def generate_compliant_text(self, prompt, semantic_state=None, constraints=None, 
-                                    max_tokens=100, compliance_mode="standard"):
-                # Specialist model with built-in compliance for domain
-                return {
-                    "text": f"Compliant response for {self.domain} query with distilled knowledge",
-                    "is_compliant": True,
-                    "compliance_score": 0.9
-                }
-                
-            def get_embeddings(self, text):
-                # Placeholder embedding generation
-                return np.random.randn(self.embedding_dim)
-                
-            def get_context_size(self):
-                return 2048  # Smaller context window
-                
-        return DistilledSpecialistModel(domain)
-
-    def count_parameters(self, model):
-        """
-        Count number of trainable parameters in a model.
+        max_domain = max(domain_scores.items(), key=lambda x: x[1])
         
-        Args:
-            model: Model to count parameters for
+        # Only return domain if score is above threshold
+        if max_domain[1] > 0:
+            return max_domain[0]
             
-        Returns:
-            Number of parameters
-        """
-        # In a real implementation, this would count actual model parameters
-        # Placeholder implementation
-        if hasattr(model, 'domain'):
-            if 'pruned' in getattr(model, 'id', ''):
-                return 350_000_000  # 350M parameters for pruned model
-            elif 'quantized' in getattr(model, 'id', ''):
-                return 750_000_000  # 750M parameters for quantized model
-            elif 'distilled' in getattr(model, 'id', ''):
-                return 250_000_000  # 250M parameters for distilled model
-        
-        # Default for unknown model
-        return 1_000_000_000  # 1B parameters
-        
-    def estimate_memory_footprint(self, model):
-        """
-        Estimate memory footprint of a model in MB.
-        
-        Args:
-            model: Model to estimate memory footprint for
-            
-        Returns:
-            Estimated memory usage in MB
-        """
-        # In a real implementation, this would measure actual memory usage
-        # Simplified estimation based on parameter count and compression
-        params = self.count_parameters(model)
-        
-        # Base memory: 4 bytes per parameter for FP32
-        base_memory = params * 4 / (1024 * 1024)  # Convert to MB
-        
-        # Apply compression factor based on model type
-        if hasattr(model, 'id'):
-            model_id = model.id
-            if 'pruned' in model_id:
-                return base_memory * 0.6  # 40% reduction from pruning
-            elif 'quantized' in model_id:
-                bits = getattr(model, 'quantization_bits', 8)
-                return base_memory * (bits / 32)  # Reduction based on quantization bits
-            elif 'distilled' in model_id:
-                return base_memory * 0.25  # 75% reduction from distillation
-        
-        # Default for unknown model
-        return base_memory
-        
+        return None
+    
     def _initialize_optimized_knowledge_base(self):
         """
         Initialize optimized regulatory knowledge base with efficient indexing.
@@ -1425,75 +1150,7 @@ class EnhancedCompliantLanguageProcessor:
                 self.concept_index = {concept.id: concept for concept in concepts}
                 
         return OptimizedRegulatoryKnowledgeBase() 
-       
-    def _initialize_optimized_llm(self):
-        """
-        Initialize optimized base language model.
-        
-        Returns:
-            Optimized language model
-        """
-        class OptimizedLanguageModel:
-            def __init__(self):
-                self.id = "base_llm"
-                self.embedding_dim = 1024
-                self.tokenizer = self._initialize_tokenizer()
-                self.eos_token_id = 0  # End of sequence token ID
-                
-            def get_next_token_logits(self, input_ids):
-                """Get next token logits for input sequence"""
-                # Placeholder implementation
-                return np.random.randn(50000)  # Random logits for vocabulary
-                
-            def sample_token(self, logits):
-                """Sample token from logits"""
-                # Simple sampling implementation
-                # In real systems, this would use temperature, top-k, top-p, etc.
-                probs = self._softmax(logits)
-                return np.random.choice(len(probs), p=probs)
-                
-            def tokenize(self, text):
-                """Tokenize text to token IDs"""
-                # Simplified tokenization (placeholder)
-                return [1, 2, 3, 4, 5]  # Dummy token IDs
-                
-            def decode_token(self, token_id):
-                """Decode token ID to text"""
-                # Simplified token decoding (placeholder)
-                return f"<token_{token_id}>"
-                
-            def get_embeddings(self, text):
-                """Get embeddings for text"""
-                # Placeholder embedding generation
-                return np.random.randn(self.embedding_dim)
-                
-            def is_eos_token(self, token_id):
-                """Check if token is end-of-sequence token"""
-                return token_id == self.eos_token_id
-                
-            def get_context_size(self):
-                """Get maximum context size"""
-                return 8192
-                
-            def _initialize_tokenizer(self):
-                """Initialize tokenizer"""
-                # Placeholder tokenizer
-                class SimpleTokenizer:
-                    def encode(self, text):
-                        return [1, 2, 3, 4, 5]  # Dummy token IDs
-                        
-                    def decode(self, token_ids):
-                        return "Decoded text"
-                        
-                return SimpleTokenizer()
-                
-            def _softmax(self, logits):
-                """Convert logits to probabilities"""
-                exp_logits = np.exp(logits - np.max(logits))
-                return exp_logits / exp_logits.sum()
-                
-        return OptimizedLanguageModel()
-        
+    
     def _initialize_symbolic_engine(self):
         """
         Initialize symbolic reasoning engine for compliance verification.
@@ -1537,146 +1194,70 @@ class EnhancedCompliantLanguageProcessor:
                 return LogicalReasoner()
                 
         return SymbolicReasoningEngine()
-        
-    def _analyze_complexity(self, prompt):
-        """
-        Analyze complexity of the prompt to determine optimal processing strategy.
-        
-        Args:
-            prompt: Input prompt text
-            
-        Returns:
-            Complexity score (0-1)
-        """
-        # In a real implementation, this would analyze various complexity factors
-        # Simplified implementation based on length and structure
-        
-        # Length factor (longer prompts are more complex)
-        length = len(prompt)
-        length_factor = min(length / 1000, 1.0)
-        
-        # Structure factor (prompts with questions are more complex)
-        question_factor = 0.3 if "?" in prompt else 0.0
-        
-        # Topic factor (certain topics increase complexity)
-        complex_topics = ["compliance", "regulation", "legal", "technical", "medical"]
-        topic_matches = sum(1 for topic in complex_topics if topic.lower() in prompt.lower())
-        topic_factor = min(topic_matches * 0.15, 0.5)
-        
-        # Combine factors
-        complexity = (0.5 * length_factor) + (0.3 * question_factor) + (0.2 * topic_factor)
-        
-        return min(complexity, 1.0)
-        
-    def _analyze_regulatory_specificity(self, context):
-        """
-        Analyze regulatory specificity of the context.
-        
-        Args:
-            context: Context information
-            
-        Returns:
-            Regulatory specificity score (0-1)
-        """
-        # If no context, low specificity
-        if not context:
-            return 0.1
-            
-        # Convert context to string if it's a dictionary
-        if isinstance(context, dict):
-            context_str = str(context)
-        else:
-            context_str = str(context)
-            
-        # Check for regulatory framework mentions
-        frameworks = ["GDPR", "HIPAA", "FINREG", "CCPA", "PCI DSS", "SOX"]
-        framework_matches = sum(1 for fw in frameworks if fw in context_str)
-        framework_factor = min(framework_matches * 0.2, 0.6)
-        
-        # Check for regulatory concept mentions
-        concepts = ["compliance", "regulation", "privacy", "security", "consent", "data subject"]
-        concept_matches = sum(1 for concept in concepts if concept.lower() in context_str.lower())
-        concept_factor = min(concept_matches * 0.1, 0.4)
-        
-        # Combine factors
-        specificity = (0.7 * framework_factor) + (0.3 * concept_factor)
-        
-        return min(specificity, 1.0)
-        
-    def _detect_regulatory_domain(self, prompt, context):
-        """
-        Detect relevant regulatory domain for the request.
-        
-        Args:
-            prompt: Input prompt text
-            context: Context information
-            
-        Returns:
-            Detected domain or None
-        """
-        # Combine prompt and context for analysis
-        combined_text = prompt
-        if context:
-            if isinstance(context, dict):
-                combined_text += " " + str(context)
-            else:
-                combined_text += " " + context
-                
-        combined_text = combined_text.lower()
-        
-        # Check for domain-specific indicators
-        domain_indicators = {
-            "GDPR": ["gdpr", "personal data", "data subject", "privacy", "consent", "eu regulation"],
-            "HIPAA": ["hipaa", "health", "medical", "patient", "phi", "healthcare"],
-            "FINREG": ["financial", "banking", "aml", "kyc", "transaction", "money laundering"]
-        }
-        
-        # Score each domain
-        domain_scores = {}
-        for domain, indicators in domain_indicators.items():
-            score = sum(combined_text.count(indicator) for indicator in indicators)
-            domain_scores[domain] = score
-            
-        # Get domain with highest score
-        if not domain_scores:
-            return None
-            
-        max_domain = max(domain_scores.items(), key=lambda x: x[1])
-        
-        # Only return domain if score is above threshold
-        if max_domain[1] > 0:
-            return max_domain[0]
-            
-        return None
     
-    def _format_compliance_error(self, error, metadata):
+    def _initialize_specialist_models(self):
         """
-        Format compliance error response.
+        Initialize specialist models for different regulatory domains.
         
-        Args:
-            error: Error message or description
-            metadata: Additional metadata about the error
-            
-        Returns:
-            Formatted error response
+        In a real implementation, these would be actual model configurations
+        or model identifier strings for the gateway.
         """
-        if isinstance(error, list):
-            # Multiple issues
-            primary_error = error[0] if error else "Compliance requirements not met"
-            additional_issues = error[1:] if len(error) > 1 else []
-            
-            return {
-                'text': None,
-                'is_compliant': False,
-                'compliance_error': primary_error,
-                'additional_issues': additional_issues,
-                'compliance_metadata': metadata
+        # Just register model identifiers
+        self.model_registry.models = {
+            "GDPR": {
+                "model": "gdpr_specialist",
+                "metadata": {
+                    "domain": "data_privacy",
+                    "parameter_count": 350_000_000,
+                    "quantization_bits": 8
+                }
+            },
+            "HIPAA": {
+                "model": "hipaa_specialist",
+                "metadata": {
+                    "domain": "health_privacy",
+                    "parameter_count": 750_000_000,
+                    "quantization_bits": 8
+                }
+            },
+            "FINREG": {
+                "model": "finreg_specialist",
+                "metadata": {
+                    "domain": "financial_compliance",
+                    "parameter_count": 250_000_000,
+                    "quantization_bits": 8
+                }
             }
-        else:
-            # Single issue
-            return {
-                'text': None,
-                'is_compliant': False,
-                'compliance_error': error,
-                'compliance_metadata': metadata
-            }
+        }
+
+# Factory function to create a gateway client from config
+def create_gateway_client(config):
+    """
+    Create and configure an LLMGatewayClient from a configuration dict.
+    
+    Args:
+        config: Gateway configuration dictionary
+        
+    Returns:
+        Configured LLMGatewayClient instance
+    """
+    # Convert config dict to GatewayConfig object
+    gateway_config = GatewayConfig(
+        gateway_id=config.get("gateway_id", "default_gateway"),
+        default_provider=config.get("default_provider", "openai"),
+        default_model_identifier=config.get("default_model", "gpt-4"),
+        max_retries=config.get("max_retries", 2),
+        retry_delay_seconds=config.get("retry_delay_seconds", 1.0),
+        default_timeout_seconds=config.get("timeout_seconds", 60.0),
+        allowed_providers=config.get("allowed_providers", []),
+        caching_enabled=config.get("caching_enabled", True),
+        cache_default_ttl_seconds=config.get("cache_ttl_seconds", 3600),
+        default_compliance_mode=config.get("default_compliance_mode", "strict"),
+        logging_level=config.get("logging_level", "INFO")
+    )
+    
+    # Create provider factory
+    provider_factory = ProviderFactory()
+    
+    # Create and return client
+    return LLMGatewayClient(gateway_config, provider_factory)
